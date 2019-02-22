@@ -1,0 +1,355 @@
+---
+title: "244 Lab 7"
+author: "Gage Clawson"
+date: "2/21/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tmap)
+library(sf)
+library(spatstat)
+library(maptools)
+library(sp)
+library(raster)
+library(gstat)
+```
+
+Part 1. Hawaii raster practice
+```{r}
+hi_par <- raster("PAR_CLIM_M.tif")
+
+hi_sst <- raster("SST_LTM.tif")
+
+hi_chl <- raster("CHL_LTM.tif")
+
+par(mfrow = c(1,3))
+plot(hi_par)
+plot(hi_sst)
+plot(hi_chl)
+
+```
+
+Reproject to WGS84:
+```{r}
+
+wgs84 <- "+proj=longlat +datum=WGS84 +ellps=WGS84 +no_defs"
+
+hi_sst_84 <- projectRaster(hi_sst, crs = wgs84, method = "bilinear")
+
+hi_sst_84@crs
+
+plot(hi_sst_84)
+```
+
+raster::aggregate() for resampling
+```{r}
+#resolution decreased by an order of 10. Think hard before doing this. 
+sst_rs <- aggregate(hi_sst, fact = 10)
+plot(sst_rs)
+
+```
+
+Crop a raster:
+```{r}
+hi_sst_84@extent
+
+#create a bounding box. Decided on this box because it isolates one island. 
+bounds <- as(extent(-156.2, -154.5, 18.7, 20.4), 'SpatialPolygons')
+
+#if something does not have a crs, this is the way to do it. otherwise have to use projectRaster.
+#here we set bounds crs to the same of hi_sst_84
+crs(bounds) <- crs(hi_sst_84)
+
+#crop sst info
+sst_crop <- crop(hi_sst_84, bounds)
+plot(sst_crop)
+```
+
+Simple raster math:
+
+Nonsensical variable called "tropicality" that is the sum of PAT + SST + 2*ChlA, and we want to map that variable...
+```{r}
+hi_par_84 <- projectRaster(hi_par, crs = wgs84, method = "bilinear")
+
+hi_chla_84 <- projectRaster(hi_chl, crs = wgs84, method = "bilinear")
+
+par(mfrow = c(1,3))
+plot(hi_par_84)
+plot(hi_sst_84)
+plot(hi_chla_84)
+
+
+```
+
+```{r}
+trop <- hi_par_84 + hi_sst_84 + 2*hi_chla_84
+
+plot(trop)
+```
+
+Now let's try to look at something using tmap:
+```{r}
+islands <- read_sf(dsn = 'islands', layer = "Island_boundaries") %>%
+  dplyr::select(Island) %>% 
+  st_simplify(dTolerance = 10) %>% 
+  st_transform(crs = 4326)
+```
+
+```{r}
+tmap_mode("plot")
+
+sst_map <- tm_shape(hi_sst_84) +
+  tm_raster(title = "Mean Sea Surface Temperature") +
+  tm_layout(bg.color = "navyblue", legend.position = c("left", "bottom"), legend.text.color ="white", legend.text.size = 0.5) + 
+  tm_shape(islands) +
+  tm_fill("darkgreen")
+
+
+tmap_save(sst_map, "gage_hawaii.png", height = 5)
+```
+
+Condition rasters adnd masking
+
+Let's say: we have a sensitive species and we're trying to find habitat that it might like. We know: they like warm water (average SST >= 25.6 degrees) and solar (PAR) below 54. 
+
+```{r}
+extent(hi_sst_84) <- extent(hi_par_84)
+
+cr <- raster(nrow = 822, ncol = 1229, xmn = -160.4365, xmx = -154.5373, ymn = 18.7309, ymx = 22.44634)
+
+
+sst_new <- resample(hi_sst_84, cr, method = "bilinear")
+
+compareRaster(sst_new, hi_par_84)
+
+plot(sst_new)
+plot(hi_par_84)
+
+#make a cropped version just for Kauai
+bounds_main <- as(extent(-159.9, -159.2, 21.7, 22.3), 'SpatialPolygons')
+crs(bounds_main) <- crs(sst_new)
+
+par_kauai <- crop(hi_par_84, bounds_main)
+sst_kauai <- crop(sst_new, bounds_main)
+
+plot(sst_kauai)
+```
+
+Now we only want to isolate regions where temp >= 25.4, PAR < 54
+```{r}
+par_hab <- par_kauai
+par_hab[par_hab >= 54] <- NA
+
+sst_hab <- sst_kauai
+sst_hab[sst_hab < 25.4] <- NA
+
+plot(par_hab)
+
+# Where do these overlap? raster::mask
+suit_hab <- mask(sst_hab, par_hab)
+
+plot(suit_hab)
+```
+
+
+###Part 2. Point pattern analysis
+
+An analysis of red tree voles in Humboldt County
+
+```{r}
+voles <- read_sf(dsn = "redtreevoledata", layer = "ds033") %>%
+  dplyr::select(COUNTY) %>%
+  filter(COUNTY == "HUM") %>%
+  st_transform(crs = 4326)
+
+plot(voles)
+
+#Get humboldt county outline
+
+humboldt <- read_sf(dsn = 'redtreevoledata' , layer = "california_county_shape_file") %>%
+  filter(NAME == "Humboldt") %>%
+  dplyr::select(NAME)
+
+st_crs(humboldt) <- 4326
+
+tm_shape(humboldt) +
+  tm_fill() + 
+  tm_shape(voles) +
+  tm_dots(size = 0.2)
+
+ggplot() +
+  geom_sf(data = humboldt) +
+  geom_sf(data = voles)
+
+ggsave("humvoles.png", units = "in" , width = 4, height = 6, dpi = 300)
+
+```
+
+
+We want to explore point patterns a few different ways:
+
+- wuadrat analysis
+- distance based (neighbor analysis, G-function and K-function)
+
+```{r}
+voles_sp <- as(voles, 'Spatial')
+voles_ppp <- as(voles_sp, "ppp")
+
+humboldt_sp <- as(humboldt, "Spatial") 
+humboldt_win <- as(humboldt_sp, "owin")
+
+voles_pb <- ppp(voles_ppp$x, voles_ppp$y, window = humboldt_win)
+
+plot(voles_pb)
+
+```
+
+
+Quadrat test:
+```{r}
+voles_qt <- quadrat.test(voles_pb, nx = 5, ny =10)
+
+voles_qt
+
+plot(voles_pb)
+#plot(voles_qt, add = TRUE, cex = 0.4)
+```
+
+
+plotting kernel densities for spatial data 
+
+```{r}
+#sigma changes the bandwidth. always report the bandwidth. 
+point_density <- density(voles_pb, sigma = 0.02)
+plot(point_density)
+
+vole_raster <- raster(point_density, crs = wgs84)
+
+tm_shape(vole_raster) +
+  tm_raster()
+
+```
+
+
+Nearest neighbor
+
+G-function: considers the distance of each observation to its NEAREST neighbor
+
+K-function: considers how close all neighboring observations are to an event (concentric circles)
+
+```{r}
+r <- seq(0, 0.15, by = 0.005)
+
+gfunction <- envelope(voles_pb, fun = Gest, r = r, nsim = 20)
+
+plot(gfunction)
+
+plot(gfunction$obs ~ gfunction$r, type = "l", col = "black") +
+lines(gfunction$theo ~ gfunction$r, type = "l", col = "red")
+
+
+#K/L function: asking about how close ALL neighbors are to every event in the spatial window
+
+r2 <- seq(0, 0.5, by = 0.05)
+
+lfunction <- envelope(voles_pb, fun = Lest, r = r2, nsim = 20, global = TRUE)
+
+plot(lfunction$obs ~ lfunction$r, type = "l", col = "blue") +
+lines(lfunction$theo ~ lfunction$r, type = "l", col = "red")
+
+```
+
+Diggle-Cressie-Loosmore-Ford test of CSR
+
+```{r}
+DCLFTest <- dclf.test(voles_pb, nsim = 30)
+DCLFTest
+
+```
+
+
+###Part 3. Spatial interpolation by kriging
+
+```{r}
+ks_rain <- read_csv("KSRain2.csv")
+
+ks_sf <- st_as_sf(ks_rain, coords = c("LON", "LAT"), crs = 4326)
+plot(ks_sf)
+
+ks_counties <- read_sf(dsn = 'KSCounties', layer = "ks_counties_shapefile")
+
+st_crs(ks_counties) <- 4326
+plot(ks_counties)
+
+tm_shape(ks_counties) + 
+  tm_fill() +
+  tm_shape(ks_sf) +
+  tm_dots("AMT", size = 0.5)
+
+```
+
+```{r}
+ks_sp <- as_Spatial(ks_sf)
+
+
+```
+
+Make a spatial grid to interpolate values over
+```{r}
+#she chose some of these for resolution. For sake of time don't go much higher 
+
+lat <- seq(37, 40, length.out = 200)
+long <- seq(-94.6, -102, length = 200)
+
+grid <- expand.grid(lon = long, lat = lat)
+#convert into an af object with coords
+grid_sf <- st_as_sf(grid, coords = c("lon", "lat"), crs = 4326)
+
+grid_sp <- as_Spatial(grid_sf)
+
+```
+
+Then make a variogram and find the variogram model
+```{r}
+ks_vgm <- variogram(AMT ~ 1, ks_sp)
+
+plot(ks_vgm)
+
+ks_vgm_fit <- fit.variogram(ks_vgm, model = vgm(nugget = 0.2, psill = 0.8, range = 200, model = "Sph"))
+
+plot(ks_vgm, ks_vgm_fit)
+```
+
+Now we can do spatial interpolation
+
+```{r}
+
+
+ks_krige <- krige(AMT ~ 1, ks_sp, grid_sp, model = ks_vgm_fit)
+
+
+ks_krige_df <- as.data.frame(ks_krige)
+
+ks_krige_2 <- ks_krige_df %>%
+  rename(lon = coords.x1, lat = coords.x2, predicted = var1.pred, err = var1.var)
+
+rain_predicted <- st_as_sf(ks_krige_2, coords = c("lon", "lat"), crs = 4326)
+
+#get outline of kansas and crop to that. It is in folder called states. 
+ks <- read_sf(dsn = "states", layer = "cb_2017_us_state_20m") %>%
+  dplyr::select(NAME) %>% 
+  filter(NAME == "Kansas") %>%
+  st_transform(crs = 4326)
+
+plot(rain_predicted)
+
+rain_cropped <- st_intersection(rain_predicted, ks)
+
+plot(rain_cropped)
+```
